@@ -112,4 +112,4 @@ Built by Dhanya.
 
 ## License
 
-Add a `LICENSE` file (for example MIT) and name it here.
+MIT
