@@ -1,9 +1,9 @@
 import json
+import os
 import time
 import uuid
 from pathlib import Path
 
-import os
 import streamlit as st
 from openai import OpenAI
 
@@ -99,7 +99,6 @@ header[data-testid="stHeader"] { background: transparent; }
     padding: 1.1rem 1.3rem;
     margin-bottom: .9rem;
 }
-/* your messages get a violet edge so you can tell who is talking */
 [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
     background: var(--surface-2);
     border-left: 3px solid var(--violet);
@@ -138,7 +137,6 @@ header[data-testid="stHeader"] { background: transparent; }
 }
 .stButton > button:focus-visible { outline: 2px solid var(--violet); outline-offset: 2px; }
 
-/* the open chat in the history list */
 .stButton > button[kind="primary"],
 [data-testid="stBaseButton-primary"] {
     background: rgba(255, 90, 54, .16) !important;
@@ -191,11 +189,9 @@ header[data-testid="stHeader"] { background: transparent; }
 [data-testid="stSidebar"] [data-testid="stTickBarMin"],
 [data-testid="stSidebar"] [data-testid="stTickBarMax"] { color: var(--muted) !important; font-weight: 500; }
 
-/* history buttons: left aligned */
 [data-testid="stSidebar"] .stButton > button { justify-content: flex-start; text-align: left; }
 [data-testid="stSidebar"] .stButton > button p { text-align: left; font-size: .92rem; }
 
-/* settings box */
 [data-testid="stSidebar"] [data-testid="stExpander"] details {
     border: 1px solid var(--line);
     border-radius: 14px;
@@ -203,7 +199,6 @@ header[data-testid="stHeader"] { background: transparent; }
 }
 [data-testid="stSidebar"] [data-testid="stExpander"] summary p { color: var(--text) !important; font-weight: 600; }
 
-/* input + dropdown: force dark on every layer */
 [data-testid="stSidebar"] [data-baseweb="input"],
 [data-testid="stSidebar"] [data-baseweb="input"] *,
 [data-testid="stSidebar"] [data-baseweb="base-input"],
@@ -238,16 +233,12 @@ a { color: var(--ember) !important; }
 st.markdown(CSS, unsafe_allow_html=True)
 
 # ------------------------------------------------------------------ data ----
-GROQ_URL = "https://api.groq.com/openai/v1"
+NEBIUS_URL = "https://api.tokenfactory.nebius.com/v1/"
+KEY_URL = "https://tokenfactory.nebius.com/project/api-keys"
 HISTORY_FILE = Path(__file__).with_name("chat_history.json")
 
-PREFERRED_MODELS = [
-    "llama-3.3-70b-versatile",
-    "openai/gpt-oss-120b",
-    "openai/gpt-oss-20b",
-    "llama-3.1-8b-instant",
-]
-SKIP_WORDS = ("whisper", "orpheus", "guard", "tts", "compound", "allam", "qwen", "deepseek", "embed")
+# Used if the live model list can't be loaded
+FALLBACK_MODELS = ["nvidia/nemotron-3-super-120b-a12b"]
 
 GREETING = (
     "Hello. I'm the person your investors will be on a bad day.\n\n"
@@ -338,21 +329,54 @@ def make_title(text: str) -> str:
 # ---------------------------------------------------------------- models ----
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_models(key: str) -> list:
-    """Ask Groq which models this API key can actually use right now."""
+    """Ask Nebius which Nemotron models this API key can use right now."""
     try:
-        client = OpenAI(base_url=GROQ_URL, api_key=key)
+        client = OpenAI(base_url=NEBIUS_URL, api_key=key)
         ids = [m.id for m in client.models.list().data]
     except Exception:
         return []
-    return [i for i in ids if not any(w in i.lower() for w in SKIP_WORDS)]
+    return [i for i in ids if "nemotron" in i.lower()]
 
 
 def order_models(live: list) -> list:
     if not live:
-        return PREFERRED_MODELS
-    first = [m for m in PREFERRED_MODELS if m in live]
-    rest = sorted(m for m in live if m not in PREFERRED_MODELS)
-    return first + rest
+        return FALLBACK_MODELS
+    # Prefer the Super model, then the rest alphabetically
+    return sorted(live, key=lambda m: (0 if "super" in m.lower() else 1, m))
+
+
+def visible_tokens(stream):
+    """Yield reply text and drop any <think>...</think> reasoning blocks."""
+    buf, in_think = "", False
+    for chunk in stream:
+        if not chunk.choices:
+            continue
+        text = chunk.choices[0].delta.content
+        if not text:
+            continue
+        buf += text
+        while True:
+            if in_think:
+                end = buf.find("</think>")
+                if end == -1:
+                    buf = buf[-8:]
+                    break
+                buf = buf[end + 8:].lstrip()
+                in_think = False
+            else:
+                start = buf.find("<think>")
+                if start == -1:
+                    safe = len(buf) - 6  # keep a tail in case a tag is split
+                    if safe > 0:
+                        yield buf[:safe]
+                        buf = buf[safe:]
+                    break
+                if start > 0:
+                    yield buf[:start]
+                buf = buf[start + 7:]
+                in_think = True
+    if not in_think and buf:
+        yield buf
 
 
 # ----------------------------------------------------------------- state ----
@@ -370,20 +394,20 @@ chats = st.session_state.chats
 with st.sidebar:
     history_box = st.container()  # filled at the bottom of the script
 
-    default_key = os.environ.get("GROQ_API_KEY", "")
+    default_key = os.environ.get("NEBIUS_API_KEY", "")
     try:
-        default_key = default_key or st.secrets.get("GROQ_API_KEY", "")
+        default_key = default_key or st.secrets.get("NEBIUS_API_KEY", "")
     except Exception:
         pass
 
     with st.expander("Settings", expanded=not default_key):
         api_key = st.text_input(
-            "Groq API key",
+            "Nebius API key",
             type="password",
             value=default_key,
-            help="Free keys at console.groq.com. Never commit your key to GitHub.",
+            help="Create a key in the Nebius Token Factory console. Never commit your key to GitHub.",
         )
-        st.markdown("[Get a free Groq key](https://console.groq.com/keys)")
+        st.markdown(f"[Get a Nebius key]({KEY_URL})")
 
         level = st.select_slider("How harsh?", options=list(HARSHNESS.keys()), value="Ruthless")
 
@@ -391,7 +415,7 @@ with st.sidebar:
         model = st.selectbox(
             "Model",
             order_models(live_models),
-            help="Loaded live from your Groq account. Bigger models critique better; small ones are faster.",
+            help="NVIDIA Nemotron models available on your Nebius account.",
         )
 
 # ------------------------------------------------------------------ main ----
@@ -402,7 +426,7 @@ if not messages:
     st.markdown(
         """
         <div class="hero">
-            <div class="hero-badge"><i></i>Your idea, under pressure</div>
+            <div class="hero-badge"><i></i>Crucible</div>
             <h1>Pitch it. We'll try to break it.</h1>
             <p>Get the investor critique before you get the investor meeting.
             Flaws, risks and the questions you'll be asked.</p>
@@ -434,10 +458,9 @@ st.session_state.pending = None
 st.session_state.pending_title = None
 
 if prompt and not api_key:
-    st.error("Add your Groq API key in the sidebar Settings first. It's free at console.groq.com.")
+    st.error("Add your Nebius API key in the sidebar Settings first.")
 
 elif prompt:
-    # start a new chat if none is open
     if current_id is None:
         current_id = uuid.uuid4().hex[:8]
         chats[current_id] = {
@@ -452,7 +475,7 @@ elif prompt:
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    client = OpenAI(base_url=GROQ_URL, api_key=api_key)
+    client = OpenAI(base_url=NEBIUS_URL, api_key=api_key)
     payload = [{"role": "system", "content": build_system_prompt(level)}] + messages
 
     with st.chat_message("assistant"):
@@ -460,31 +483,25 @@ elif prompt:
             stream = client.chat.completions.create(
                 model=model,
                 messages=payload,
-                temperature=0.7,
+                temperature=0.6,
                 stream=True,
             )
-
-            def tokens():
-                for chunk in stream:
-                    if chunk.choices and chunk.choices[0].delta.content:
-                        yield chunk.choices[0].delta.content
-
-            reply = st.write_stream(tokens())
+            reply = st.write_stream(visible_tokens(stream))
             messages.append({"role": "assistant", "content": reply})
             chats[current_id]["updated"] = time.time()
             save_chats()
 
         except Exception as e:
             messages.pop()
-            if not messages:  # nothing was answered, so don't keep an empty chat
+            if not messages:
                 chats.pop(current_id, None)
                 st.session_state.current = None
             err = str(e)
             low = err.lower()
-            if "401" in err or "invalid_api_key" in low:
-                st.error("That API key was rejected. Check it in the sidebar and try again.")
-            elif "404" in err or "model_not_found" in low or "decommissioned" in low:
-                st.error("That model isn't available on your Groq account. Pick a different one in Settings and send again.")
+            if "401" in err or "invalid" in low and "key" in low:
+                st.error("That Nebius API key was rejected. Check it in Settings and try again.")
+            elif "404" in err or "model" in low and "not" in low:
+                st.error("That model isn't available on your Nebius account. Pick another in Settings and send again.")
             elif "429" in err:
                 st.error("Rate limit hit. Wait a few seconds and send it again.")
             else:
